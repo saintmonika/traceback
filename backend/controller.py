@@ -8,6 +8,7 @@ Phases: READY -> BASELINE -> DEFINE_DONE <-> VALIDATE_DEFINITION
 -> FINAL_CHECKS -> REPORT -> COMPLETED.
 """
 
+import hashlib
 import re
 import shutil
 import threading
@@ -35,6 +36,13 @@ class RunEnded(Exception):
 def assertion_failure(output):
     out = output or ""
     return "AssertionError" in out or re.search(r"^E\s+assert\b", out, re.M) is not None
+
+
+def failure_signature(outcome, output):
+    """Loop guard: the test outcome plus the sorted names of the failing tests, hashed."""
+    names = sorted(set(re.findall(r"^(?:FAILED|ERROR)\s+(\S+)", output or "", re.M)))
+    text = outcome + "|" + "|".join(names)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16], names
 
 
 class Controller:
@@ -253,6 +261,8 @@ class Controller:
         used = 0
         history = []
         proposed = set()
+        last_sig = None          # loop guard: signature of the previous failed check run
+        loop_sig = None          # set once a loop has been detected
 
         while used < max_attempts:
             self.phase("REPAIR")
@@ -295,9 +305,33 @@ class Controller:
             attempt["rejection_reason"] = reason
             self.data["repair_attempts"].append(attempt)
             self.state.save()
+
+            # ---- loop guard (SHOULD tier) ----
+            checks_failed = bool(attempt.get("checks")) and attempt["checks"]["outcome"] != "passed"
+            loop_now = False
+            if checks_failed:
+                sig, names = failure_signature(attempt["checks"]["outcome"], output)
+                attempt["failure_signature"] = {"hash": sig, "failing_tests": names}
+                self.state.save()
+                if loop_sig is not None and sig == loop_sig:
+                    self.end("attempt_limit_reached", "stop", "Loop detected again. Stopping.")
+                if loop_sig is None and sig == last_sig and used < max_attempts:
+                    loop_sig = sig
+                    loop_now = True
+                    self.data["loop_guard"] = {"triggered": True, "signature": sig,
+                                               "failing_tests": names,
+                                               "detected_after_attempt": attempt["attempt"]}
+                    feedback += (" NOTE: the same failure occurred twice in a row. Your previous "
+                                 "approach failed the same way twice; try a different approach.")
+                last_sig = sig
+            else:
+                last_sig = None    # a rejected patch breaks the run of consecutive failures
+
             history.append({"attempt": attempt["attempt"], "reasoning": attempt["reasoning"],
                             "reason": feedback, "output": output})
-            if used < max_attempts:
+            if loop_now:
+                self.decide("replan", "Loop detected: the same failure occurred twice. Re-planning once.")
+            elif used < max_attempts:
                 if attempt.get("checks") and attempt["checks"]["outcome"] == "failed":
                     self.decide("replan", f"Repair failed the checks ({attempt['checks']['failed_count']} "
                                           f"failing). Trying again, attempt {used + 1} of {max_attempts}.")

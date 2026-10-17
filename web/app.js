@@ -59,6 +59,16 @@ function liveStep() {
   return PHASE_STEP[r.current_phase] ?? 1;
 }
 
+// Which steps really finished (from completed_phases), so a stopped or blocked run
+// never shows later steps as done.
+const STEP_DONE_PHASE = [null, "VALIDATE_DEFINITION", "RUN_CHECKS", "MUTATION_AUDIT", "FINAL_CHECKS", "REPORT"];
+function stepDone(i, live) {
+  const r = S.run;
+  if (i >= live) return false;
+  if (i === 0 || isLive(r)) return true;
+  return !!(r && (r.completed_phases || []).includes(STEP_DONE_PHASE[i]));
+}
+
 function result(outcome, expectFail) {
   if (!outcome) return `<span class="label soft">— Not yet run</span>`;
   if (outcome === "passed") return `<span class="label">✓ Passed</span>`;
@@ -286,14 +296,18 @@ function render(force) {
   const shown = S.view ?? live;
 
   $("track").innerHTML = STEPS.map((name, i) => {
-    const cls = [i < live ? "done" : "", i === live ? "current" : "", i === shown && S.view !== null ? "viewing" : ""].join(" ");
-    return `<button class="step ${cls}" data-step="${i}" ${i < live ? "" : "tabindex='-1'"}>
+    const done = stepDone(i, live);
+    const cls = [done ? "done" : "", i === live ? "current" : "", i === shown && S.view !== null ? "viewing" : ""].join(" ");
+    return `<button class="step ${cls}" data-step="${i}" ${done ? "" : "tabindex='-1'"}>
       <span class="nodebox"><span class="node"></span></span><span>${String(i + 1).padStart(2, "0")} ${esc(name)}</span></button>`;
   }).join("");
 
-  $("now").innerHTML = isLive(r) ? `● ${esc(NOW_TEXT[r.current_phase] || r.current_phase)}${DOTS}` : "";
+  const stopping = isLive(r) && (r.stop_requested || S.stopping);
+  $("now").innerHTML = !isLive(r) ? ""
+    : stopping ? `● Stop requested · ending after the current step${DOTS}`
+    : `● ${esc(NOW_TEXT[r.current_phase] || r.current_phase)}${DOTS}`;
   $("back-live").hidden = S.view === null;
-  $("stop").hidden = !(isLive(r) && live >= 1 && live <= 4);
+  $("stop").hidden = !(isLive(r) && live >= 1 && live <= 4) || stopping;
 
   let html;
   if (shown === 0) html = scrIntake();
@@ -355,7 +369,7 @@ async function startRun() {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ goal }),
     });
-    S.intake = false; S.view = null; S.open.clear();
+    S.intake = false; S.view = null; S.open.clear(); S.stopping = false;
     S.run = await api(`/api/runs/${run_id}`);
     await refreshInfo();
     render(true);
@@ -368,6 +382,8 @@ async function startRun() {
 
 async function stopRun() {
   if (!S.run) return;
+  S.stopping = true;
+  render(true);
   try { await api(`/api/runs/${S.run.run_id}/stop`, { method: "POST" }); } catch (e) { /* already ended */ }
 }
 
