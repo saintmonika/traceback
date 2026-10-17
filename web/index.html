@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Traceback</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <svg class="mark" width="28" height="12" viewBox="0 0 28 12" aria-hidden="true">
+        <line x1="1" y1="6" x2="19" y2="6" stroke="currentColor" stroke-width="1.5"/>
+        <circle cx="23" cy="6" r="3.5" fill="currentColor"/>
+      </svg>
+      <span class="word">Traceback</span>
+      <span class="tagline">Trace the fix.</span>
+    </div>
+    <div class="label" id="fixture-label">Sample project (test input)</div>
+  </header>
+
+  <nav class="track" id="track" aria-label="Steps"></nav>
+
+  <div class="subbar">
+    <span class="label" id="now"></span>
+    <span class="subbar-right">
+      <button class="textbtn" id="back-live" hidden>Back to live</button>
+      <button class="textbtn" id="stop" hidden>Stop</button>
+    </span>
+  </div>
+
+  <main class="col" id="screen"></main>
+
+  <footer class="foot label" id="foot"></footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>
