@@ -8,6 +8,19 @@ Traceback turns a one-line goal into a checkable definition of done, repairs a b
 
 Built during the Recursive Agents Hackathon, Saturday October 17, 2026 (problem statement: *Done Means Done*).
 
+## Built during the hackathon
+
+Everything in `backend/` and `web/`, plus this README, `.gitignore` and `requirements.txt`, was written on October 17, 2026, after the 10:45 AM start: the controller, the planner, repair agent and gap-closer, the mutation generator and audit, the test runner, the workspace manager, the loop guard, kill-and-resume, and the web interface. The commit history shows the order it was built in. The repository itself was created at 10:41 AM containing only GitHub's default `.gitignore` template; every commit with project content is after 10:45 AM.
+
+## Not built during the hackathon
+
+- **Test input:** `fixture/pricing-demo/` is a small open-source sample project I published before the event at https://github.com/saintmonika/pricing-demo (MIT license, October 16, 2026). It was added in its own commit (`f43fddb`) without its `.git` folder and is kept separate from product code. Its test suite is deliberately thin (it checks only orders far from the threshold) so the audit has something to find. No changes were made to it at the event.
+- **Design references:** static UI mockups were made before the event as visual references only. They had no working code and are not in this repository.
+
+## Libraries and tools
+
+Python 3 with Flask (local web server), the `openai` client package (for Crusoe's OpenAI-compatible API) and pytest (running the project's tests). Everything else is the Python standard library. The web page is plain HTML, CSS and JavaScript with no framework; fonts load from Google Fonts.
+
 ---
 
 ## What happens in one run
@@ -39,9 +52,9 @@ Goal typed: *Make sure orders of exactly 100 dollars receive the 10% discount.*
 
 Agent outputs vary between runs; every run's evidence is saved under `runs/<run_id>/evidence/`.
 
-## Test input (disclosure)
+## How the test input is kept separate
 
-`fixture/pricing-demo/` is a copy of the open-source sample project https://github.com/saintmonika/pricing-demo (MIT license, published October 16, 2026, before the event), committed on its own without its `.git` folder. Traceback's code does not refer to anything specific in this project; the only reference is `FIXTURE_PATH` in `backend/config.py`. Agents receive only the goal, the project files, and run results, never the expected fix.
+Traceback's code does not refer to anything specific in the sample project; the only reference is `FIXTURE_PATH` in `backend/config.py`. Agents receive only the goal, the project files, and run results, never the expected fix.
 
 ## Models
 
