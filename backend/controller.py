@@ -29,6 +29,20 @@ class StopRequested(Exception):
     pass
 
 
+class StateCounter(CallCounter):
+    """Call counter that saves the count to state BEFORE each call, so a call
+    in flight when the process dies still counts toward the limit after a resume."""
+
+    def __init__(self, controller, used=0):
+        super().__init__(used=used)
+        self.controller = controller
+
+    def take(self):
+        n = super().take()
+        self.controller.sync_calls()
+        return n
+
+
 class RunEnded(Exception):
     """Raised internally when a phase sets a final status."""
 
@@ -46,21 +60,40 @@ def failure_signature(outcome, output):
 
 
 class Controller:
-    def __init__(self, goal, log=None):
-        self.goal = goal.strip()
+    def __init__(self, goal, log=None, existing_run_id=None, existing_data=None):
         self.log = log or (lambda msg: None)
         self.stop_event = threading.Event()
-        self.run_id = make_run_id()
-        self.folder = RunFolder(self.run_id)
-        self.folder.create()
-        self.state = RunState(self.folder.root, new_state(self.run_id, self.goal))
-        self.state.save()
-        self.evidence = RunEvidence(self.state)
-        self.counter = CallCounter()
-        self.fixture_hashes = None
-        self.done_test_code = None
-        self.done_test_output = None
         self.mutation_map = {}
+        self.resuming = existing_run_id is not None
+        if self.resuming:
+            self.run_id = existing_run_id
+            self.folder = RunFolder(self.run_id)
+            self.state = RunState(self.folder.root, existing_data)
+            self.goal = existing_data["goal"]
+            self.counter = StateCounter(self, used=existing_data.get("model_calls_used", 0))
+            self.fixture_hashes = existing_data.get("fixture_hashes")
+            rd = existing_data.get("resume_data") or {}
+            self.done_test_code = rd.get("done_test_code")
+            self.done_test_output = rd.get("done_test_output")
+        else:
+            self.goal = goal.strip()
+            self.run_id = make_run_id()
+            self.folder = RunFolder(self.run_id)
+            self.folder.create()
+            self.state = RunState(self.folder.root, new_state(self.run_id, self.goal))
+            self.state.save()
+            self.counter = StateCounter(self)
+            self.fixture_hashes = None
+            self.done_test_code = None
+            self.done_test_output = None
+        self.evidence = RunEvidence(self.state)
+
+    @classmethod
+    def for_resume(cls, run_id, data, log=None):
+        return cls(None, log=log, existing_run_id=run_id, existing_data=data)
+
+    def resume_data(self):
+        return self.data.setdefault("resume_data", {})
 
     # ------------------------------------------------------------------ utils
     @property
@@ -112,12 +145,23 @@ class Controller:
         try:
             if not api_key_present():
                 raise MissingAPIKey("CRUSOE_API_KEY is not set in the Terminal that started Traceback.")
-            self.ready()
-            self.baseline()
-            self.define_done()
-            self.repair()
-            survivors = self.mutation_audit()
-            self.gap_closure(survivors)
+            done = lambda p: p in self.data["completed_phases"]
+            if self.resuming:
+                self.rebuild_from_state()
+            else:
+                self.ready()
+            if not done("BASELINE"):
+                self.baseline()
+            if not done("VALIDATE_DEFINITION"):
+                self.define_done()
+            if not done("RUN_CHECKS"):
+                self.repair()
+            if not done("MUTATION_AUDIT"):
+                survivors = self.mutation_audit()
+            else:
+                survivors = self.restore_mutations()
+            if not done("GAP_CLOSURE"):
+                self.gap_closure(survivors)
             self.final_checks()
             self.report_phase()
         except RunEnded:
@@ -150,8 +194,70 @@ class Controller:
     def ready(self):
         self.phase("READY")
         self.fixture_hashes = hash_tree(config.FIXTURE_DIR)
+        self.data["fixture_hashes"] = self.fixture_hashes
         self.folder.copy_fixture()
         self.state.complete_phase("READY")
+
+    # ------------------------------------------------------------ resume
+    def first_incomplete_phase(self):
+        order = ["READY", "BASELINE", "VALIDATE_DEFINITION", "RUN_CHECKS", "MUTATION_AUDIT",
+                 "GAP_CLOSURE", "FINAL_CHECKS", "REPORT"]
+        names = {"VALIDATE_DEFINITION": "DEFINE_DONE", "RUN_CHECKS": "REPAIR"}
+        for p in order:
+            if p not in self.data["completed_phases"]:
+                return names.get(p, p)
+        return "REPORT"
+
+    def mark_resumed(self):
+        """Record the resume in state and the decision log (called by the server)."""
+        phase = self.first_incomplete_phase()
+        self.data.setdefault("resumed", []).append({
+            "time": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+            "phase": phase,
+            "completed_phases": list(self.data["completed_phases"]),
+        })
+        self.decide("continue", f"Resumed after interruption, starting from {phase}.")
+
+    def rebuild_from_state(self):
+        """Never trust the folder: rebuild the workspace from saved facts only."""
+        f = self.folder
+        for d in (f.workspace, f.mutants, f.checks):
+            d = f.safe(d)
+            if d.exists():
+                shutil.rmtree(d)
+        f.mutants.mkdir()
+        f.checks.mkdir()
+        if self.fixture_hashes is None:
+            self.fixture_hashes = hash_tree(config.FIXTURE_DIR)
+            self.data["fixture_hashes"] = self.fixture_hashes
+        f.copy_fixture()
+        rd = self.data.get("resume_data") or {}
+        if "VALIDATE_DEFINITION" in self.data["completed_phases"] and rd.get("done_test_code"):
+            f.write(f.workspace, config.DONE_TEST_FILE, rd["done_test_code"])
+        if "RUN_CHECKS" in self.data["completed_phases"] and rd.get("repaired_file"):
+            f.write(f.workspace, rd["repaired_file"]["path"], rd["repaired_file"]["content"])
+        for g in self.data.get("gaps", []):
+            code = (rd.get("gap_code") or {}).get(g.get("mutation_id"))
+            if g["status"] == "accepted" and code:
+                f.write(f.workspace, g["file"], code)
+        self.state.save()
+
+    def restore_mutations(self):
+        """MUTATION_AUDIT already completed: regenerate the same mutations (deterministic)
+        and recreate the surviving mutants' folders for gap validation. No tests are rerun."""
+        patch = self.data["patch"]
+        rd = self.data.get("resume_data") or {}
+        text = rd["repaired_file"]["content"]
+        mutations = generate_mutations(text, patch["file"], patch["changed_lines"], config.MAX_MUTATIONS)
+        self.mutation_map = {m["id"]: m for m in mutations}
+        survivors = [r for r in self.data.get("mutations", []) if r["outcome"] == "survived"]
+        for surv in survivors:
+            m = self.mutation_map.get(surv["id"])
+            if m is None or m["description"] != surv["description"]:
+                raise RuntimeError("Could not regenerate the same mutations on resume")
+            dest = self.folder.fresh_copy(self.folder.mutants / surv["id"])
+            self.folder.write(dest, m["file"], m["text"])
+        return survivors
 
     def baseline(self):
         self.phase("BASELINE")
@@ -165,9 +271,11 @@ class Controller:
 
     def define_done(self):
         max_attempts = config.MAX_PLANNER_ATTEMPTS
-        used = 0
-        history = []
-        files = list_files(self.folder.workspace)
+        prior = self.data["planner_attempts"]
+        used = sum(max(1, a.get("model_calls", 1)) for a in prior)       # carried over on resume
+        history = [{"attempt": a["attempt"], "reason": a.get("rejection_reason") or "", "output": None}
+                   for a in prior if a.get("rejection_reason")]
+        files = [p for p in list_files(self.folder.workspace) if p != config.DONE_TEST_FILE]
         b = self.data["baseline"]
         baseline_summary = f"{b['passed_count']} existing tests, all passing"
 
@@ -236,6 +344,8 @@ class Controller:
             attempt["accepted"] = True
             self.done_test_code = code
             self.done_test_output = output
+            self.resume_data()["done_test_code"] = code
+            self.resume_data()["done_test_output"] = output[-20000:]
             self.decide("continue", "Definition of done validated: the agent's test fails on the "
                                     "original code, as required.")
             return None, None
@@ -258,8 +368,11 @@ class Controller:
         max_attempts = config.MAX_REPAIR_ATTEMPTS
         dod = self.data["definition_of_done"]
         ws = self.folder.workspace
-        used = 0
-        history = []
+        prior = self.data["repair_attempts"]
+        used = sum(max(1, a.get("model_calls", 1)) for a in prior)       # carried over on resume
+        history = [{"attempt": a["attempt"], "reasoning": a.get("reasoning"),
+                    "reason": a.get("rejection_reason") or "", "output": None}
+                   for a in prior if a.get("rejection_reason")]
         proposed = set()
         last_sig = None          # loop guard: signature of the previous failed check run
         loop_sig = None          # set once a loop has been detected
@@ -362,6 +475,7 @@ class Controller:
                                   "previous_content_evidence_id":
                                       self.evidence.save("original_file_before_repair", "RUN_CHECKS", previous)}
             attempt["accepted"] = True
+            self.resume_data()["repaired_file"] = {"path": rel, "content": new_code}
             self.decide("continue", "All checks pass on the repair. Auditing whether the checks "
                                     "would catch changes to the fix.")
             return None, None, output
@@ -425,9 +539,15 @@ class Controller:
         to_close = survivors[:config.MAX_SURVIVORS_TO_CLOSE]
 
         for index, surv in enumerate(to_close):
+            if any(g.get("mutation_id") == surv["id"] for g in self.data["gaps"]):
+                continue                                             # already handled before a resume
             mutation = self.mutation_map[surv["id"]]
             gap_file = config.GAP_TEST_FILES[index]
-            used, history, accepted = 0, [], None
+            prior = [a for a in self.data["gap_attempts"] if a["survivor"] == surv["id"]]
+            used = sum(max(1, a.get("model_calls", 1)) for a in prior)   # carried over on resume
+            history = [{"attempt": a["attempt"], "reason": a.get("rejection_reason") or "", "output": None}
+                       for a in prior if a.get("rejection_reason")]
+            accepted = None
             gap = {"survivor": surv["description"], "mutation_id": surv["id"], "file": gap_file,
                    "statement": None, "status": "unresolved",
                    "label": "agent-written, flagged for review", "evidence_ids": [],
@@ -443,7 +563,8 @@ class Controller:
                                        phase="GAP_CLOSURE")
                 self.sync_calls()
                 used += max(1, len(reply.calls))
-                attempt = {"survivor": surv["id"], "attempt": len(history) + 1,
+                n_prev = sum(1 for a in self.data["gap_attempts"] if a["survivor"] == surv["id"])
+                attempt = {"survivor": surv["id"], "attempt": n_prev + 1,
                            "model_calls": len(reply.calls), "evidence_ids": reply.evidence_ids,
                            "accepted": False, "rejection_reason": None, "statement": None}
                 gap["evidence_ids"] += reply.evidence_ids
@@ -466,6 +587,7 @@ class Controller:
                 self.state.save()
                 if accepted:
                     self.folder.write(self.folder.workspace, gap_file, reply.code)
+                    self.resume_data().setdefault("gap_code", {})[surv["id"]] = reply.code
                     gap["statement"] = accepted["statement"]
                     gap["status"] = "accepted"
                     self.data["assumptions"].append({"statement": accepted["statement"],
@@ -485,6 +607,8 @@ class Controller:
             self.state.save()
 
         for surv in survivors[config.MAX_SURVIVORS_TO_CLOSE:]:
+            if any(g.get("mutation_id") == surv["id"] for g in self.data["gaps"]):
+                continue
             self.data["gaps"].append({"survivor": surv["description"], "mutation_id": surv["id"],
                                       "file": None, "statement": None,
                                       "status": "beyond_closing_limit",

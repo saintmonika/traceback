@@ -23,6 +23,8 @@ A controller written in ordinary Python runs the whole investigation with no fur
 7. **Close the gap**: for each surviving variant, a gap-closer agent writes one stronger test. The controller accepts it only if it **passes on the repair and fails on the variant**. Accepted tests are labeled *agent-written, flagged for review*.
 8. **Final checks and report**: the full suite must pass again, closed variants are re-run and must now be caught, and the original project is hashed again. The report is assembled from run data with fixed wording.
 
+**Kill-and-resume.** If the server process is killed mid-run, restarting it continues the run from the first unfinished phase. Every accepted output (the done test, the repaired file, gap tests) is saved in `state.json` the moment it is accepted. On restart, the controller deletes the half-built workspace, rebuilds it from the original project plus those saved outputs, and continues; completed model work is never requested again, and the model-call counter is saved before each call so limits hold across a crash. The page shows "Connection lost. Retrying..." while the server is down and a "Resumed from phase" banner afterwards. Tested during the event by killing the server during the planner call and during gap closure.
+
 Final statuses: *Verified within scope*, *Verification gap remains*, *Blocked*, *Attempt limit reached*, *Stopped*, *Failed*. The interface never says "fixed".
 
 ## Example result from a real run during the event
@@ -112,7 +114,6 @@ runs/               created at runtime, ignored by git
 
 ## Not implemented
 
-- Kill-and-resume from saved state
 - Support for projects other than the fixture
 - Applying the patch to the original project
 - Watch mode, ticket queues, parallel agents

@@ -15,6 +15,8 @@ from flask import Flask, jsonify, request, send_from_directory, Response
 from . import config
 from .controller import Controller
 from .crusoe_client import api_key_present, MISSING_KEY_MESSAGE
+from .report import build_report
+from .state import RunState
 
 WEB_DIR = config.REPO_ROOT / "web"
 RUN_ID_RE = re.compile(r"^run_\d{8}_\d{6}(_\d+)?$")
@@ -134,7 +136,38 @@ def get_evidence(run_id, evidence_id):
     return Response(path.read_text(encoding="utf-8"), mimetype="text/plain; charset=utf-8")
 
 
+def resume_interrupted_run():
+    """On server start: if the most recent run is still marked running, it was
+    interrupted. Resume it from the first incomplete phase (rebuilt from saved state)."""
+    if not config.RUNS_ROOT.is_dir():
+        return
+    runs = sorted(p.name for p in config.RUNS_ROOT.iterdir()
+                  if p.is_dir() and RUN_ID_RE.match(p.name) and (p / "state.json").is_file())
+    if not runs:
+        return
+    run_id = runs[-1]
+    root = config.RUNS_ROOT / run_id
+    data = json.loads((root / "state.json").read_text(encoding="utf-8"))
+    if data.get("status") != "running":
+        return                                   # final statuses are never resumed
+    if not api_key_present():
+        st = RunState(root, data)
+        st.add_decision("stop", "Cannot resume: API key not loaded in this Terminal.")
+        data["status"] = "blocked"
+        data["report"] = build_report(data)
+        st.save()
+        print(f"Run {run_id} was interrupted but cannot resume: API key not loaded in this Terminal.")
+        return
+    controller = Controller.for_resume(run_id, data, log=print)
+    controller.mark_resumed()
+    thread = threading.Thread(target=controller.run, daemon=True)
+    _active["controller"], _active["thread"] = controller, thread
+    thread.start()
+    print(f"Resumed interrupted run {run_id} from {controller.data['resumed'][-1]['phase']}.")
+
+
 if __name__ == "__main__":
+    resume_interrupted_run()
     if not api_key_present():
         print("Warning: " + MISSING_KEY_MESSAGE)
         print("The page will open, but runs will be refused until the key is loaded.")

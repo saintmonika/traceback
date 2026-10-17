@@ -33,7 +33,7 @@ const BASIS = {
 const DOTS = `<span class="dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>`;
 
 const S = { info: null, run: null, intake: true, view: null, timer: null,
-            ev: {}, open: new Set(), lastKey: "", error: "" };
+            ev: {}, open: new Set(), lastKey: "", error: "", offline: false };
 
 // ---------------------------------------------------------------- helpers
 const $ = (id) => document.getElementById(id);
@@ -288,7 +288,7 @@ function logPanel(r) {
 // ---------------------------------------------------------------- render
 function render(force) {
   const r = S.run;
-  const key = JSON.stringify([S.intake, S.view, r && r.updated_at, r && r.status, r && r.live, S.error, S.info && S.info.running]);
+  const key = JSON.stringify([S.intake, S.view, r && r.updated_at, r && r.status, r && r.live, S.error, S.info && S.info.running, S.offline]);
   if (!force && key === S.lastKey) return;
   S.lastKey = key;
 
@@ -303,7 +303,8 @@ function render(force) {
   }).join("");
 
   const stopping = isLive(r) && (r.stop_requested || S.stopping);
-  $("now").innerHTML = !isLive(r) ? ""
+  $("now").innerHTML = S.offline ? "Connection lost. Retrying…"
+    : !isLive(r) ? ""
     : stopping ? `● Stop requested · ending after the current step${DOTS}`
     : `● ${esc(NOW_TEXT[r.current_phase] || r.current_phase)}${DOTS}`;
   $("back-live").hidden = S.view === null;
@@ -316,6 +317,11 @@ function render(force) {
   else if (shown === 3) html = scrAudit(r);
   else if (shown === 4) html = scrGap(r);
   else html = scrReport(r);
+  const res = r && r.resumed && r.resumed.length ? r.resumed[r.resumed.length - 1] : null;
+  if (res && shown !== 0) {
+    html = `<div class="panel"><span class="label">Resumed from phase: ${esc(res.phase)}</span>
+      <p class="muted">Completed before the interruption: ${esc(res.completed_phases.join(", ") || "none")}</p></div>` + html;
+  }
   if (shown !== 0 && r) html += logPanel(r);
   $("screen").innerHTML = html;
   if (isLive(r) && shown === live) {
@@ -392,9 +398,16 @@ async function poll() {
   if (!S.run) return;
   try {
     S.run = await api(`/api/runs/${S.run.run_id}`);
+    S.offline = false;
     if (!isLive(S.run)) await refreshInfo();
     render();
-  } catch (e) { /* keep last known state */ }
+  } catch (e) {
+    // Server unreachable (for example, restarting): keep the last state and retry every 2 seconds.
+    S.offline = true;
+    render();
+    S.timer = setTimeout(poll, 2000);
+    return;
+  }
   if (isLive(S.run)) S.timer = setTimeout(poll, 1000);
 }
 

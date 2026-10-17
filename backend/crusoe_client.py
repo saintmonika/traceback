@@ -141,15 +141,25 @@ class ParseResult:
         return self.error is None
 
 
+_BARE_PATH_RE = re.compile(r"^[ \t]*[\w./\\-]+\.py[ \t]*:?[ \t]*$")
+
+
 def _strip_inner_fence(code):
-    """If the code inside the markers is itself wrapped in ``` fences, unwrap it."""
+    """Clean the code inside the markers: drop a leading line that is only a file
+    path (models often add one; it is not code), and unwrap ``` fences."""
     lines = code.split("\n")
-    while lines and not lines[0].strip():
-        lines.pop(0)
-    while lines and not lines[-1].strip():
-        lines.pop()
-    if len(lines) >= 2 and lines[0].strip().startswith("```") and lines[-1].strip() == "```":
-        lines = lines[1:-1]
+    for _ in range(2):
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if lines and _BARE_PATH_RE.match(lines[0]):
+            lines.pop(0)
+            continue
+        if len(lines) >= 2 and lines[0].strip().startswith("```") and lines[-1].strip() == "```":
+            lines = lines[1:-1]
+            continue
+        break
     return "\n".join(lines) + "\n" if lines else ""
 
 
