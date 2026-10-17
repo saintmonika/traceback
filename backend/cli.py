@@ -1,68 +1,83 @@
 """Run one investigation from Terminal (used while building).
 
-Step B version: creates a run folder, copies the fixture, runs the baseline,
-and prints the result. Later steps extend this to the full controller.
-
-Usage, from the repository root:
+Usage, from the repository root (with the API key loaded):
     python3 -m backend.cli "your one-line goal"
 """
 
 import sys
+import time
 
-from . import config
-from .state import RunState, RunEvidence, new_state, load_state
-from .test_runner import run_pytest
-from .workspace import RunFolder, make_run_id, hash_tree
+from .controller import Controller
+from .crusoe_client import api_key_present, MISSING_KEY_MESSAGE
+
+
+def show(title):
+    print(f"\n=== {title} ===")
 
 
 def main(argv):
     if not argv or not argv[0].strip():
         print('Usage: python3 -m backend.cli "your one-line goal"')
         return 2
-    goal = argv[0].strip()
+    if not api_key_present():
+        print(MISSING_KEY_MESSAGE)
+        return 2
 
-    # READY
-    run_id = make_run_id()
-    folder = RunFolder(run_id)
-    folder.create()
-    state = RunState(folder.root, new_state(run_id, goal))
-    state.save()
-    evidence = RunEvidence(state)
-    fixture_hashes_before = hash_tree(config.FIXTURE_DIR)
-    folder.copy_fixture()
-    state.complete_phase("READY")
-    print(f"Run: {run_id}")
-    print(f"Run folder: {folder.root}")
+    start = time.monotonic()
+    c = Controller(argv[0], log=print)
+    print(f"Run: {c.run_id}\nRun folder: {c.folder.root}")
+    d = c.run()
+    elapsed = round(time.monotonic() - start, 1)
 
-    # BASELINE
-    state.set_phase("BASELINE")
-    result, _output = run_pytest(folder.workspace, evidence=evidence,
-                                 label="baseline_output", phase="BASELINE")
-    state.set("baseline", result)
-    if result["outcome"] == "passed":
-        state.add_decision("continue", "Baseline established: the existing tests pass on the original code.")
-        state.complete_phase("BASELINE")
+    show("Definition of done")
+    dod = d.get("definition_of_done")
+    if dod:
+        print(f"Required behavior: {dod['required_behavior']}")
+        print(f"Test summary: {dod['test_summary']}")
+        print(f"Allowed scope: {', '.join(dod['allowed_scope'])}")
+        for p in dod["preservation_requirements"]:
+            print(f"Preserve: {p['statement']} [{p['basis']}]")
+        for a in d["assumptions"]:
+            print(f"Assumption: {a['statement']} [{a['basis']}]")
     else:
-        state.add_decision("stop", "The existing tests do not pass on the original code.")
-        state.data["status"] = "blocked"
-        state.save()
+        print("(none accepted)")
 
-    # Integrity check on the original fixture
-    fixture_unchanged = hash_tree(config.FIXTURE_DIR) == fixture_hashes_before
-    state.set("fixture_unchanged", fixture_unchanged)
+    show("Planner attempts")
+    for a in d["planner_attempts"]:
+        v = a.get("validation") or {}
+        print(f"#{a['attempt']}: accepted={a['accepted']}, test on original={v.get('outcome')}, "
+              f"rejected because: {a['rejection_reason']}")
 
-    # Print results, read back from state.json to prove it is readable
-    saved = load_state(folder.root)
-    b = saved["baseline"]
-    print(f"Baseline: {b['outcome']} ({b['passed_count']} passed, {b['failed_count']} failed, "
-          f"{b['duration_seconds']}s), evidence {b['evidence_id']}")
-    print(f"state.json readable: yes (status={saved['status']}, phase={saved['current_phase']}, "
-          f"completed={saved['completed_phases']})")
-    print(f"Original fixture unchanged: {saved['fixture_unchanged']}")
-    print("Decisions:")
-    for d in saved["decisions"]:
-        print(f"  [{d['decision']}] {d['reason']}")
-    return 0 if b["outcome"] == "passed" else 1
+    show("Repair attempts")
+    for a in d["repair_attempts"]:
+        ch = a.get("checks") or {}
+        print(f"#{a['attempt']}: file={a['file']}, accepted={a['accepted']}, checks={ch.get('outcome')}, "
+              f"rejected because: {a['rejection_reason']}")
+        print(f"   agent reasoning: {a.get('reasoning')}")
+    if d.get("blocked_reason_agent_words"):
+        print(f"Agent's words (blocked): {d['blocked_reason_agent_words']}")
+
+    patch = d.get("patch")
+    if patch:
+        show(f"Repair diff ({patch['file']}, changed lines {patch['changed_lines']})")
+        print((c.folder.evidence / patch["diff_evidence_id"]).read_text(encoding="utf-8"))
+
+    show("Checks")
+    for ch in d["checks"]:
+        print(f"{ch['label']}: {ch['outcome']} ({ch['passed_count']} passed, {ch['failed_count']} failed)")
+
+    show("Decision log")
+    for x in d["decisions"]:
+        print(f"[{x['decision']}] {x['reason']}")
+
+    show("Summary")
+    print(f"Status: {d['status']}")
+    print(f"Model calls used: {d['model_calls_used']} of {d['limits']['MAX_MODEL_CALLS']}")
+    print(f"Original project unchanged: {d['fixture_unchanged']}")
+    if d.get("error"):
+        print(f"Error: {d['error']}")
+    print(f"Time: {elapsed}s")
+    return 0
 
 
 if __name__ == "__main__":
