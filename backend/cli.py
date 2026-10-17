@@ -62,6 +62,22 @@ def main(argv):
         show(f"Repair diff ({patch['file']}, changed lines {patch['changed_lines']})")
         print((c.folder.evidence / patch["diff_evidence_id"]).read_text(encoding="utf-8"))
 
+    a = d.get("audit_summary")
+    if a:
+        show("Mutation audit")
+        if a.get("no_mutable_code"):
+            print("No mutable code on the changed lines.")
+        for m in d["mutations"]:
+            print(f"{m['id']}: {m['description']} -> {m['outcome']} (tests {m['test_outcome']})")
+        print(f"Tested {a['tested']}, caught {a['caught']}, survived {a['survived']}, invalid {a['invalid']}")
+
+    if d["gaps"]:
+        show("Verification gaps")
+        for g in d["gaps"]:
+            print(f"{g['survivor']}: {g['status']}"
+                  + (f" -> added test: {g['statement']} ({g['label']})" if g["status"] == "accepted" else "")
+                  + (f", re-check: {g['recheck']['outcome']}" if g.get("recheck") else ""))
+
     show("Checks")
     for ch in d["checks"]:
         print(f"{ch['label']}: {ch['outcome']} ({ch['passed_count']} passed, {ch['failed_count']} failed)")
@@ -69,6 +85,19 @@ def main(argv):
     show("Decision log")
     for x in d["decisions"]:
         print(f"[{x['decision']}] {x['reason']}")
+
+    r = d.get("report") or {}
+    show("Report")
+    print(f"{r.get('status_label')}: {r.get('summary')}")
+    if r.get("what_changed"):
+        print(f"What changed: {r['what_changed']['text']}")
+    for x in r.get("what_was_checked", []):
+        print(f"Checked: {x}")
+    for x in r.get("what_i_couldnt_check", []):
+        print(f"Couldn't check: {x}")
+    for x in r.get("assumptions", []):
+        print(f"Assumption: {x['statement']} [{x['basis_label']}]")
+    print(r.get("integrity", ""))
 
     show("Summary")
     print(f"Status: {d['status']}")

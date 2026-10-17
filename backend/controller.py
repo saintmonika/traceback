@@ -3,12 +3,13 @@
 Models only propose. Every transition is decided here from real command
 output, and every decision is logged with a fixed template.
 
-Step C version: READY -> BASELINE -> DEFINE_DONE <-> VALIDATE_DEFINITION
--> REPAIR <-> RUN_CHECKS. Later steps add MUTATION_AUDIT, GAP_CLOSURE,
-VALIDATE_GAP, FINAL_CHECKS, REPORT.
+Phases: READY -> BASELINE -> DEFINE_DONE <-> VALIDATE_DEFINITION
+-> REPAIR <-> RUN_CHECKS -> MUTATION_AUDIT -> GAP_CLOSURE <-> VALIDATE_GAP
+-> FINAL_CHECKS -> REPORT -> COMPLETED.
 """
 
 import re
+import shutil
 import threading
 import traceback
 
@@ -17,7 +18,10 @@ from . import agents
 from .crusoe_client import CallCounter, ModelCallLimitReached, MissingAPIKey, api_key_present
 from .state import RunState, RunEvidence, new_state
 from .test_runner import run_pytest
-from .workspace import RunFolder, make_run_id, hash_tree, list_files, unified_diff, changed_lines
+from .workspace import (RunFolder, make_run_id, hash_tree, list_files, unified_diff,
+                        changed_lines, IGNORED_NAMES)
+from .mutation import generate_mutations, audit, run_mutant, classify
+from .report import build_report
 
 
 class StopRequested(Exception):
@@ -48,6 +52,7 @@ class Controller:
         self.fixture_hashes = None
         self.done_test_code = None
         self.done_test_output = None
+        self.mutation_map = {}
 
     # ------------------------------------------------------------------ utils
     @property
@@ -103,9 +108,10 @@ class Controller:
             self.baseline()
             self.define_done()
             self.repair()
-            # Step C stops here. Later steps continue with the mutation audit.
-            self.data["status"] = "build_incomplete"
-            self.state.set_phase("MUTATION_AUDIT (not built yet)")
+            survivors = self.mutation_audit()
+            self.gap_closure(survivors)
+            self.final_checks()
+            self.report_phase()
         except RunEnded:
             pass
         except StopRequested:
@@ -124,6 +130,11 @@ class Controller:
             self.sync_calls()
             if self.fixture_hashes is not None:
                 self.data["fixture_unchanged"] = hash_tree(config.FIXTURE_DIR) == self.fixture_hashes
+            try:
+                self.data["report"] = build_report(self.data)
+            except Exception as exc:
+                self.data["report"] = {"status_label": self.data["status"],
+                                       "summary": f"Report could not be assembled: {exc}"}
             self.state.save()
         return self.data
 
@@ -329,3 +340,191 @@ class Controller:
         return (f"the checks could not run ({result['outcome']})",
                 f"Your patch was applied but the tests could not run ({result['outcome']}).",
                 output)
+
+    # ------------------------------------------------------- mutation audit
+    def mutation_audit(self):
+        self.phase("MUTATION_AUDIT")
+        patch = self.data["patch"]
+        rel = patch["file"]
+        text = self.folder.read(self.folder.workspace, rel)
+        mutations = generate_mutations(text, rel, patch["changed_lines"], config.MAX_MUTATIONS)
+        self.mutation_map = {m["id"]: m for m in mutations}
+
+        if not mutations:
+            self.data["audit_summary"] = {"tested": 0, "caught": 0, "survived": 0, "invalid": 0,
+                                          "no_mutable_code": True}
+            self.decide("continue", "Mutation audit complete: 0 tested, 0 caught, 0 survived.")
+            self.state.complete_phase("MUTATION_AUDIT")
+            return []
+
+        results, summary = audit(self.folder, mutations, self.evidence, self.check_stop)
+        summary["no_mutable_code"] = False
+        self.data["mutations"] = results
+        self.data["audit_summary"] = summary
+        self.decide("continue", f"Mutation audit complete: {summary['tested']} tested, "
+                                f"{summary['caught']} caught, {summary['survived']} survived.")
+        self.state.complete_phase("MUTATION_AUDIT")
+
+        survivors = [r for r in results if r["outcome"] == "survived"]
+        if not survivors:
+            self.decide("continue", "No variant survived. Moving to the report.")
+        else:
+            self.decide("replan", f"{len(survivors)} variant(s) survived. Adding a stronger test.")
+        return survivors
+
+    # ---------------------------------------------------------- gap closure
+    def current_test_files(self):
+        ws = self.folder.workspace
+        out = []
+        for f in list_files(ws):
+            name = f.rsplit("/", 1)[-1]
+            if f.endswith(".py") and name.startswith("test_"):
+                out.append((f, self.folder.read(ws, f)))
+        return out
+
+    def gap_closure(self, survivors):
+        if not survivors:
+            return
+        dod = self.data["definition_of_done"]
+        patch = self.data["patch"]
+        max_attempts = config.MAX_GAP_ATTEMPTS
+        to_close = survivors[:config.MAX_SURVIVORS_TO_CLOSE]
+
+        for index, surv in enumerate(to_close):
+            mutation = self.mutation_map[surv["id"]]
+            gap_file = config.GAP_TEST_FILES[index]
+            used, history, accepted = 0, [], None
+            gap = {"survivor": surv["description"], "mutation_id": surv["id"], "file": gap_file,
+                   "statement": None, "status": "unresolved",
+                   "label": "agent-written, flagged for review", "evidence_ids": [],
+                   "recheck": None}
+
+            while used < max_attempts:
+                self.phase("GAP_CLOSURE")
+                repaired_text = self.folder.read(self.folder.workspace, patch["file"])
+                reply = agents.run_gap(self.goal, dod, patch["file"], repaired_text,
+                                       surv["description"], mutation["diff"],
+                                       self.current_test_files(), history,
+                                       counter=self.counter, evidence=self.evidence,
+                                       phase="GAP_CLOSURE")
+                self.sync_calls()
+                used += max(1, len(reply.calls))
+                attempt = {"survivor": surv["id"], "attempt": len(history) + 1,
+                           "model_calls": len(reply.calls), "evidence_ids": reply.evidence_ids,
+                           "accepted": False, "rejection_reason": None, "statement": None}
+                gap["evidence_ids"] += reply.evidence_ids
+                output = None
+
+                if not reply.ok:
+                    reason, feedback = "the reply was not in the required format", reply.error
+                else:
+                    norm, problem = agents.validate_gap(reply.data, reply.code)
+                    if problem:
+                        reason, feedback = problem, f"Your test was rejected: {problem}."
+                    else:
+                        attempt["statement"] = norm["statement"]
+                        reason, feedback, output = self.validate_gap(surv, gap_file, reply.code, gap)
+                        if reason is None:
+                            accepted = norm
+                            attempt["accepted"] = True
+
+                self.data["gap_attempts"].append(attempt)
+                self.state.save()
+                if accepted:
+                    self.folder.write(self.folder.workspace, gap_file, reply.code)
+                    gap["statement"] = accepted["statement"]
+                    gap["status"] = "accepted"
+                    self.data["assumptions"].append({"statement": accepted["statement"],
+                                                     "basis": "agent_inference"})
+                    self.decide("continue", "Added test passes on the repair and fails on the variant.")
+                    break
+                attempt["rejection_reason"] = reason
+                self.state.save()
+                history.append({"attempt": attempt["attempt"], "reason": feedback, "output": output})
+                if used < max_attempts:
+                    self.decide("replan", f"Added test rejected ({reason}). Trying again, attempt "
+                                          f"{used + 1} of {max_attempts}.")
+
+            if not accepted:
+                self.decide("stop", f"Gap left unresolved after {max_attempts} attempts.")
+            self.data["gaps"].append(gap)
+            self.state.save()
+
+        for surv in survivors[config.MAX_SURVIVORS_TO_CLOSE:]:
+            self.data["gaps"].append({"survivor": surv["description"], "mutation_id": surv["id"],
+                                      "file": None, "statement": None,
+                                      "status": "beyond_closing_limit",
+                                      "label": None, "evidence_ids": [], "recheck": None})
+        self.state.complete_phase("GAP_CLOSURE")
+        self.state.save()
+
+    def validate_gap(self, surv, gap_file, code, gap):
+        """Gap test must pass on the repair (full suite) and fail with an
+        assertion on the surviving mutant. Returns (None, None, None) if accepted."""
+        self.phase("VALIDATE_GAP")
+        n = len(self.data["gap_attempts"]) + 1
+        self.evidence.save(f"gap_test_{surv['id']}_try{n}", "VALIDATE_GAP", code)
+
+        on_repair = self.folder.fresh_copy(self.folder.checks / f"g{n:02d}_repair")
+        self.folder.write(on_repair, gap_file, code)
+        r1, out1 = self.test(on_repair, label=f"gap_{surv['id']}_try{n}_on_repair")
+        if r1["outcome"] != "passed":
+            return (f"it does not pass on the repaired code ({r1['outcome']})",
+                    "Your test must PASS on the repaired code, together with all existing tests. "
+                    f"Result: {r1['outcome']}.", out1)
+
+        on_mutant = self.folder.safe(self.folder.checks / f"g{n:02d}_mutant")
+        if on_mutant.exists():
+            shutil.rmtree(on_mutant)
+        shutil.copytree(self.folder.mutants / surv["id"], on_mutant,
+                        ignore=shutil.ignore_patterns(*IGNORED_NAMES))
+        self.folder.write(on_mutant, gap_file, code)
+        r2, out2 = self.test(on_mutant, gap_file, label=f"gap_{surv['id']}_try{n}_on_variant")
+        if r2["outcome"] == "failed" and assertion_failure(out2):
+            gap["validation"] = {"on_repair": r1, "on_variant": r2}
+            return None, None, None
+        if r2["outcome"] == "passed":
+            return ("it passes on the variant, so it does not catch it",
+                    "Your test PASSED on the changed code, so it does not tell the repair apart "
+                    "from the change. Test the behavior that differs.", out2)
+        return (f"it does not fail with an assertion on the variant ({r2['outcome']})",
+                "Your test must fail on the changed code through an assert, not an error.", out2)
+
+    # --------------------------------------------------------- final checks
+    def final_checks(self):
+        self.phase("FINAL_CHECKS")
+        result, _ = self.test(self.folder.workspace, label="final_checks")
+        self.data["final_checks"] = result
+        self.add_check("Final full suite on the repaired copy", result)
+        if result["outcome"] != "passed":
+            self.data["error"] = "final checks did not pass"
+            self.end("failed", "stop", "Unexpected error: final checks did not pass.")
+
+        for gap in self.data["gaps"]:
+            if gap["status"] != "accepted":
+                continue
+            self.check_stop()
+            mutation = self.mutation_map[gap["mutation_id"]]
+            r, _ = run_mutant(self.folder, mutation, f"{gap['mutation_id']}_recheck", self.evidence,
+                              "FINAL_CHECKS", f"recheck_{gap['mutation_id']}_output")
+            gap["recheck"] = {"outcome": classify(r["outcome"]), "evidence_id": r["evidence_id"]}
+            if gap["recheck"]["outcome"] != "caught":
+                gap["status"] = "unresolved"
+        if self.fixture_hashes is not None:
+            self.data["fixture_unchanged"] = hash_tree(config.FIXTURE_DIR) == self.fixture_hashes
+        self.state.complete_phase("FINAL_CHECKS")
+
+    # --------------------------------------------------------------- report
+    def report_phase(self):
+        self.phase("REPORT")
+        a = self.data.get("audit_summary") or {}
+        unresolved = any(g["status"] != "accepted" for g in self.data["gaps"])
+        audited = a.get("tested", 0) > 0 and not a.get("no_mutable_code")
+        verified = (self.data["final_checks"]["outcome"] == "passed"
+                    and self.data["definition_of_done"] is not None
+                    and audited and not unresolved)
+        self.data["status"] = "completed_verified_within_scope" if verified else "completed_with_uncertainty"
+        self.decide("stop", "Definition of done satisfied within the tested scope.")
+        self.state.complete_phase("REPORT")
+        self.state.set_phase("COMPLETED")
+        self.state.complete_phase("COMPLETED")

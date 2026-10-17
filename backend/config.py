@@ -86,7 +86,7 @@ def limits_dict():
 
 
 # ---------------------------------------------------------------------------
-# Fixed file names for agent-written tests (chosen by the controller,
+# Set file names for agent-written tests (chosen by the controller,
 # never by a model)
 # ---------------------------------------------------------------------------
 DONE_TEST_FILE = "tests/test_traceback_done.py"
