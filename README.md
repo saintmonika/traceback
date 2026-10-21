@@ -2,6 +2,8 @@
 
 **Trace the fix.**
 
+**Demo video (1 min):** [watch on Google Drive](https://drive.google.com/file/d/1Zcxdawle-zVjP5G7wxUV8OSVbg6_PciC/view?usp=drive_link)
+
 A fix passing checks is not the same as evidence that the fix is right.
 
 Traceback turns a one-line goal into a checkable definition of done, repairs a bug in an isolated workspace, audits its own repaired code with generated mutations, closes real verification gaps with agent-written checks, and reports an honest, bounded outcome.
